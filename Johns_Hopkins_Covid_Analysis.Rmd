@@ -1,0 +1,213 @@
+---
+title: "Johns Hopkins Covid Analysis"
+author: "Iván Monares Vélez"
+date: '2022-06-19'
+output: html_document
+---
+
+```{r setup, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(lubridate)
+library(forecast)
+library(xts)
+
+```
+
+## Johns Hopkins Covid Analysis
+
+This is an analysis of the Covid 19 cases in Mexico from February 2020 to June 2022. The data was obtained from the Johns Hopkins University CSSE COVID-19 Dataset (https://github.com/CSSEGISandData/COVID-19/tree/master/csse_covid_19_data).
+
+```{r data_loading, warning=FALSE, message=FALSE}
+
+url_in <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/"
+filenames <- c("time_series_covid19_confirmed_global.csv", "time_series_covid19_deaths_global.csv")
+urls<-str_c(url_in, filenames)
+url_uid <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/UID_ISO_FIPS_LookUp_Table.csv"
+
+global_cases <- read_csv(urls[1])
+global_deaths <- read_csv(urls[2])
+uid <- read_csv(url_uid)
+
+global_cases <- global_cases %>%
+  pivot_longer(cols = -c("Province/State", "Country/Region", "Lat", "Long"),
+               names_to = "date",
+               values_to = "cases") %>%
+  select(-c("Lat", "Long"))
+
+global_deaths <- global_deaths %>%
+  pivot_longer(cols = -c("Province/State", "Country/Region", "Lat", "Long"),
+               names_to = "date",
+               values_to = "deaths") %>%
+  select(-c("Lat", "Long"))
+
+global <- global_cases %>%
+  full_join(global_deaths)  %>%
+  rename(Country_Region = "Country/Region",
+         Province_State = "Province/State") %>%
+  mutate(date = mdy(date)) %>%
+  filter(cases > 0)
+
+global <- global %>%
+  left_join(uid, by = c("Province_State", "Country_Region")) %>%
+  select(-c(UID, FIPS)) %>%
+  select(Province_State, Country_Region, date, cases, deaths, Population, Combined_Key)
+
+global_by_country <- global %>% 
+  group_by(Country_Region, date) %>%
+  summarize(cases = sum(cases), deaths = sum(deaths), Population = sum(Population)) %>%
+  mutate(deaths_per_mill = deaths*1000000 / Population) %>%
+  select(Country_Region, date, cases, deaths, deaths_per_mill, Population) %>%
+  ungroup() 
+
+```
+
+```{r visualization, warning=FALSE}
+
+
+global_by_country_totals <- global_by_country %>%
+  group_by(Country_Region) %>%
+  summarize(deaths = max(deaths), cases = max(cases), population = max(Population),
+            cases_per_thou = 1000*cases/population, deaths_per_thou = 1000 * deaths / population) %>%
+  filter(cases > 0, population > 0)
+
+global_by_country_totals %>% 
+  slice_max(cases, n = 25) %>%
+  mutate( ToHighlight = ifelse( Country_Region == "Mexico", "yes", "no" ) ) %>%
+  ggplot(aes(x=reorder(Country_Region, cases), y=cases, fill=ToHighlight)) +
+  geom_bar(stat="identity") +
+  scale_fill_manual( values = c( "yes"="tomato", "no"="steelblue" ), guide = "none" ) +
+  geom_text(aes(label=cases), vjust=0.3, hjust=-0.1, size=3.5)+
+  ylim(0, 9.5e7)+
+  ggtitle("COVID 19 Cases per Country (top 25)") +
+  xlab("Country") + 
+  ylab("Cases") +
+  coord_flip()
+
+
+```
+
+### Analysis 1
+
+When sorting all countries according to then number of Covid cases, Mexico is positioned at the 21st place with a total of 5,852,596 registered patients. Given Mexico's population of 128.9 million people, this is equivalent to 4.54% of the national population.
+
+It is also worth noting that in proportion to the country with the most cases (US), Mexico has 1/15 th of the cases with a third of the population, but has a closer relation with the second place (India), with 1/7 th of the cases with a tenth of the population
+
+```{r visualization_Mexico, warning=FALSE}
+
+Mexico <- global_by_country %>% filter(Country_Region == "Mexico")
+
+Mexico %>% 
+  filter(cases > 0) %>%
+  ggplot(aes(x = date, y = cases)) +
+  geom_line(aes(color = "cases")) +
+  geom_point(aes(color = "cases")) + 
+  geom_line(aes(y = deaths, color = "deaths")) + 
+  geom_point(aes(y = deaths, color = "deaths")) + 
+  scale_y_log10() + 
+  theme(legend.position = "bottom", 
+        axis.text.x = element_text(angle = 90)) +
+  ggtitle("COVID 19 in Mexico (log scale)") +
+  xlab("Date") + 
+  ylab("")
+  
+Mexico %>%
+  filter(cases > 0) %>%
+  ggplot(aes(x = date, y = cases)) +
+  geom_line(aes(color = "cases")) +
+  geom_point(aes(color = "cases")) +
+  geom_line(aes(y = deaths, color = "deaths")) +
+  geom_point(aes(y = deaths, color = "deaths")) +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 90)) +
+  ggtitle("COVID 19 in Mexico") +
+  xlab("Date") + 
+  ylab("")
+
+```
+
+### Analisis 2
+
+When taking the growth of cases and deaths in a logarithmic scale, it appears as if they have leveled off. 
+However, if the same data is ploted in a linear scale, it becomes evident that the Covid 19 spread has not yet been stopped.
+
+It is worth noting that only 5% of infected patients succumb to it, having a much slower growth rate than the Covid infection itself.
+
+```{r data_transformation, warning=FALSE}
+
+Mexico <- Mexico %>%
+  mutate(new_cases = cases - lag(cases), new_deaths = deaths - lag(deaths),
+        cases_per_thou = 1000*cases/Population, deaths_per_thou = 1000 * deaths / Population,
+        new_cases_per_thou = 1000*new_cases/Population, new_deaths_per_thou = 1000 * new_deaths / Population) %>%
+  mutate(new_cases = ifelse(is.na(new_cases), 0, new_cases)) %>%
+  mutate(new_deaths = ifelse(is.na(new_deaths), 0, new_deaths)) %>%
+  mutate(new_cases_per_thou = ifelse(is.na(new_cases_per_thou), 0, new_cases_per_thou)) %>%
+  mutate(new_deaths_per_thou = ifelse(is.na(new_deaths_per_thou), 0, new_deaths_per_thou))
+
+```
+
+```{r second_visualization, warning=FALSE}
+
+monthly_cases <- Mexico %>%
+  mutate(Month_Yr = format_ISO8601(date, precision = "ym")) %>%
+  mutate(Month_Yr = ym(Month_Yr)) %>%
+  group_by(Month_Yr) %>%
+  summarize(deaths = max(deaths), cases = max(cases), population = max(Population),
+            cases_per_thou = 1000*cases/population, deaths_per_thou = 1000 * deaths / population) %>%
+  mutate(new_cases = cases - lag(cases), new_deaths = deaths - lag(deaths)) %>%
+  mutate(new_cases = ifelse(is.na(new_cases), 0, new_cases)) %>%
+  mutate(new_deaths = ifelse(is.na(new_deaths), 0, new_deaths)) %>%
+  filter(cases > 0)
+  
+monthly_cases %>%
+  ggplot(aes(x = Month_Yr, y = new_cases)) +
+  geom_line(aes(color = "new_cases")) +
+  geom_point(aes(color = "new_cases")) +
+  geom_line(aes(y = new_deaths, color = "new_deaths")) +
+  geom_point(aes(y = new_deaths, color = "new_deaths")) +
+  scale_y_log10() + 
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 90)) +
+  labs(title = "", y = NULL) +
+  ggtitle("Monthly new COVID 19 cases and deaths in Mexico") +
+  xlab("Date") + 
+  ylab("")
+
+```
+
+### Analisis 3
+
+After aggregating the data it is possible to perceive the rate of growth of the Covid 19 infection by plotting the number of new cases registered each month. It had a high growth rate in the first half of 2020 but then leveled off around 200 thusand new cases per month. Starting 2021, the rate of infection has been significantly reduced, with its lowest point being in May at just over 36 thousand new cases and only about 600 deaths.
+
+```{r model, warning=FALSE}
+
+cases <- Mexico %>% pull(cases)
+dates <- Mexico %>% pull(date)
+
+cases_series <- xts(cases, order.by=dates)
+cases_forecast <- forecast(auto.arima(cases_series), h = 365)
+plot(cases_forecast)
+
+
+```
+
+### Analisis 4
+
+Taking the number of cases throughout the last two years, it is possible to create a forecast for the following year. If the rate of infection remains approximately the same as it is now, it is estimated that in 12 months the number of total cases in Mexico will have reached 7.5 million people, which would mean that an additional 100,000 people will have died in Mexico due to Covid 19 by the end of June 2023. 
+
+
+### Conclusion
+
+Mexico has been able to greatly control the spread of Covid 19, with only 5% of the population being infected and only a 0.25% of the national population dying due to the virus. The rate of grown of the infection seems to be slowing down, but it still has the potential to reach a total of 7.5 million victims within the year. Therefore, it is of great importance to ensure that all medical precautions are taken to ensure that the infection rate can keep decreasing and new Covid cases cease.
+
+### Bias
+
+This data analysis report has a lack of information regarding the implement ion of Covid 19 protocols, including the use of face masks and quarantining, which has a very significant impact into the spread of the virus. Likewise, there is no information regarding gender, age or socio-economical status of the patient, which could give an insight into the most vulnerable populations.
+
+Further research regarding this topic should attempt to take this factors into account, as well as try and dive down into a more detailed study breaking down the infection per each state of the Country. 
+
+### Session Information
+
+```{r sessioninfo}
+sessionInfo()
+```
